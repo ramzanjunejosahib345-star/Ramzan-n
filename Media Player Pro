@@ -1,3 +1,5 @@
+-- KSR_PLUGIN_ID: media_player_pro
+-- KSR_VERSION: 1.2
 require "import"
 import "android.widget.*"
 import "android.view.*"
@@ -16,15 +18,32 @@ import "java.io.File"
 import "android.os.Build"
 
 activity.setTheme(android.R.style.Theme_Material_Light_NoActionBar)
--- پورٹریٹ میں لاک: گھمانے سے اسکرین دوبارہ نہیں بنتی، اس لیے بٹن غائب یا کریش نہیں ہوتے
+-- Portrait lock: rotating does not rebuild the screen, so buttons do not vanish or crash
 pcall(function() activity.setRequestedOrientation(1) end)
 
 allPlayers = {}
 playToken = 0
 uiHandlers = {}
+-- Shared registry: lives in the Java process, so it survives closing and reopening the plugin
+function sharedPlayers()
+  local list = nil
+  pcall(function()
+    local props = luajava.bindClass("java.lang.System").getProperties()
+    list = props.get("KSR_MP_PLAYERS")
+    if list == nil then
+      list = luajava.newInstance("java.util.ArrayList")
+      props.put("KSR_MP_PLAYERS", list)
+    end
+  end)
+  return list
+end
 function newPlayer()
   local p = MediaPlayer()
   allPlayers[#allPlayers + 1] = p
+  pcall(function()
+    local l = sharedPlayers()
+    if l then l.add(p) end
+  end)
   return p
 end
 function safeFn(f)
@@ -135,7 +154,7 @@ function speak(t)
   end) 
 end
 
--- ہر بنا ہوا پلیئر روکتا اور چھوڑتا ہے، تاکہ کوئی پیچھے چلتا نہ رہ جائے
+-- Stops and releases every player ever created (also from earlier runs), so nothing keeps playing in the background
 function releasePlayer()
   playToken = playToken + 1
   pcall(function()
@@ -154,6 +173,25 @@ function releasePlayer()
     pcall(function() p.release() end)
   end
   allPlayers = {}
+  -- players left over from earlier runs of the plugin (screen closed / phone locked / reopened)
+  pcall(function()
+    local l = sharedPlayers()
+    if l then
+      local n = tonumber(l.size()) or 0
+      for i = n - 1, 0, -1 do
+        local ok, p = pcall(function() return l.get(i) end)
+        if ok and p then
+          pcall(function() p.setOnPreparedListener(nil) end)
+          pcall(function() p.setOnCompletionListener(nil) end)
+          pcall(function() p.setOnErrorListener(nil) end)
+          pcall(function() p.stop() end)
+          pcall(function() p.reset() end)
+          pcall(function() p.release() end)
+        end
+      end
+      l.clear()
+    end
+  end)
   player = newPlayer()
 end
 
@@ -903,3 +941,304 @@ mainList.onItemClick=function(l,v,p)
     end
   end)
 end
+
+require "import"
+import "com.androlua.Http"
+import "com.androlua.LuaDialog"
+import "android.widget.Toast"
+import "android.os.Handler"
+import "android.os.Looper"
+import "java.lang.Thread"
+import "java.lang.Runnable"
+import "java.lang.System"
+import "java.io.File"
+import "android.content.Context"
+import "android.media.ToneGenerator"
+import "android.media.AudioManager"
+import "android.os.Vibrator"
+import "android.os.Build"
+import "android.os.VibrationEffect"
+
+local CURRENT_VERSION = "1.2"
+local VERSION_URL = "https://raw.githubusercontent.com/ramzanjunejosahib345-star/Ramzan-n/main/ramzan1"
+local UPDATE_CODE_URL = "https://raw.githubusercontent.com/ramzanjunejosahib345-star/Ramzan-n/main/Media%20Player%20Pro"
+local PLUGIN_PATH = (function()
+    local src = debug.getinfo(1, "S").source
+    return src and src:match("^@?(.*)$") or ""
+end)()
+local updateInProgress = false
+
+local prefs = (service or activity).getSharedPreferences("AutoUpdatePrefs", Context.MODE_PRIVATE)
+
+local function playNotification()
+    pcall(function()
+        local tone = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 100)
+        tone.startTone(ToneGenerator.TONE_PROP_ACK, 100)
+    end)
+end
+
+local function trim(s)
+    if s == nil then return "" end
+    return tostring(s):gsub("^%s*(.-)%s*$", "%1")
+end
+
+local function showUpdateErrorDialog(title, message)
+    Handler(Looper.getMainLooper()).post(Runnable({
+        run = function()
+            local errorDialog = LuaDialog(service or activity)
+            errorDialog.setTitle(title)
+            errorDialog.setMessage(message)
+            errorDialog.setButton("OK", function()
+                errorDialog.dismiss()
+            end)
+            errorDialog.show()
+        end
+    }))
+end
+
+local function checkAndShowNewFeatures()
+    local lastShown = prefs.getString("lastShownVersion", "")
+    if lastShown ~= CURRENT_VERSION then
+        Handler(Looper.getMainLooper()).post(Runnable{
+            run=function()
+                playNotification()
+                local featuresDialog = LuaDialog(service or activity)
+                featuresDialog.setTitle("New Update Details")
+                featuresDialog.setMessage("Enter New Update Features... Optional testing")
+                featuresDialog.setButton("OK", function() 
+                    featuresDialog.dismiss() 
+                end)
+                featuresDialog.show()
+                prefs.edit().putString("lastShownVersion", CURRENT_VERSION).apply()
+            end
+        })
+    end
+end
+
+local SELF_MARKER = "KSR_PLUGIN_ID: media_player_pro"
+
+local function fileHasMarker(path)
+    local ok, res = pcall(function()
+        local f = io.open(path, "rb")
+        if not f then return false end
+        local head = f:read(700) or ""
+        f:close()
+        return head:find(SELF_MARKER, 1, true) ~= nil
+    end)
+    return ok and res
+end
+
+local function fileSize(path)
+    local ok, n = pcall(function()
+        local f = io.open(path, "rb")
+        if not f then return -1 end
+        local sz = f:seek("end")
+        f:close()
+        return sz or -1
+    end)
+    if ok then return n end
+    return -1
+end
+
+-- Find this plugin's own file: first by the running path, then by scanning plugin folders for the marker
+local function findSelfPath()
+    local tried = {}
+    pcall(function()
+        local src = debug.getinfo(1, "S").source
+        local p = src and src:match("^@(.*)$")
+        if p and p ~= "" then tried[#tried + 1] = p end
+    end)
+    if PLUGIN_PATH and PLUGIN_PATH ~= "" then tried[#tried + 1] = PLUGIN_PATH end
+    for _, p in ipairs(tried) do
+        if fileHasMarker(p) then return p, "path" end
+    end
+    local base = nil
+    pcall(function() base = tostring(luajava.bindClass("android.os.Environment").getExternalStorageDirectory().getAbsolutePath()) end)
+    base = base or "/sdcard"
+    local roots = {base .. "/Download/AndroLua+", base .. "/AndroLua+", base .. "/\232\167\163\232\175\180/Plugins", base .. "/\232\167\163\232\175\180", base .. "/Download", base .. "/Documents", base .. "/Android/media"}
+    local AR = luajava.bindClass("java.lang.reflect.Array")
+    local found = nil
+    local function scan(dir, depth)
+        if found then return end
+        pcall(function()
+            local l = File(dir).listFiles()
+            if l == nil then return end
+            for i = 0, tonumber(AR.getLength(l)) - 1 do
+                local f = l[i]
+                if f.isDirectory() then
+                    if depth < 3 then scan(tostring(f.getAbsolutePath()), depth + 1) end
+                else
+                    local nm = tostring(f.getName()):lower()
+                    local len = tonumber(f.length()) or 0
+                    if (nm:match("%.txt$") or nm:match("%.lua$") or not nm:find(".", 1, true)) and len > 1000 and len < 3000000 then
+                        local pth = tostring(f.getAbsolutePath())
+                        if fileHasMarker(pth) then found = pth return end
+                    end
+                end
+            end
+        end)
+    end
+    for _, r in ipairs(roots) do scan(r, 0); if found then break end end
+    if found then return found, "scan" end
+    if #tried > 0 then return tried[1], "unverified" end
+    return nil, "none"
+end
+
+local function copyFileBytes(from, to)
+    local f = io.open(from, "rb")
+    if not f then return false end
+    local data = f:read("a")
+    f:close()
+    local o = io.open(to, "wb")
+    if not o then return false end
+    o:write(data)
+    o:close()
+    return fileSize(to) == #data
+end
+
+local function performUpdate(mainCode, onlineVersion)
+    if not mainCode or trim(mainCode) == "" then
+        showUpdateErrorDialog("Update Failed", "Main plugin code is empty.")
+        return
+    end
+
+    updateInProgress = true
+
+    local function fail(reason)
+        updateInProgress = false
+        showUpdateErrorDialog("Update Failed", reason)
+    end
+
+    local function updateProcess()
+        local okAll, errAll = pcall(function()
+            local path, how = findSelfPath()
+            if not path then
+                fail("Plugin file not found. Please send this message to the developer. (step: find file)")
+                return
+            end
+            if not mainCode:find(SELF_MARKER, 1, true) then
+                fail("The downloaded file is not this plugin (marker missing). Update cancelled. Your plugin is unchanged.")
+                return
+            end
+            if not load(mainCode) then
+                fail("The downloaded file has an error. Update cancelled. Your plugin is unchanged.")
+                return
+            end
+            -- backup in the app's own folder (always writable)
+            local backup = nil
+            pcall(function()
+                local dir = (service or activity).getExternalFilesDir(nil)
+                if dir == nil then dir = (service or activity).getFilesDir() end
+                backup = tostring(dir.getAbsolutePath()) .. "/media_player_pro_backup.txt"
+                if not copyFileBytes(path, backup) then backup = nil end
+            end)
+            local o, eOpen = io.open(path, "wb")
+            if not o then
+                fail("Cannot write the plugin file. Path: " .. tostring(path) .. " (" .. tostring(how) .. "). Reason: " .. tostring(eOpen) .. ". Please send this message to the developer.")
+                return
+            end
+            local okw, ew = pcall(function() o:write(mainCode) o:flush() end)
+            pcall(function() o:close() end)
+            local size = fileSize(path)
+            if (not okw) or size ~= #mainCode then
+                local restored = false
+                if backup then restored = copyFileBytes(backup, path) end
+                fail("Writing the plugin file failed (" .. tostring(ew) .. "). Path: " .. tostring(path) .. ". Old version " .. (restored and "restored." or "backup is in the app folder.") .. " Please send this message to the developer.")
+                return
+            end
+            PLUGIN_PATH = path
+            updateInProgress = false
+            Handler(Looper.getMainLooper()).post(Runnable({
+                run = function()
+                    playNotification()
+                    local successDialog = LuaDialog(service or activity)
+                    successDialog.setTitle("Update Successful")
+                    successDialog.setMessage("Successfully updated to version " .. tostring(onlineVersion) .. ".\n\nClick OK to restart and apply the update.")
+                    successDialog.setButton("OK", function()
+                        successDialog.dismiss()
+                        Handler(Looper.getMainLooper()).post(Runnable({
+                            run = function()
+                                pcall(function() if _G.mainDialog then _G.mainDialog.dismiss() _G.mainDialog = nil end end)
+                                pcall(function() if _G.mainDlg then _G.mainDlg.dismiss() _G.mainDlg = nil end end)
+                                pcall(function() if _G.allDialogBox then _G.allDialogBox.dismiss() _G.allDialogBox = nil end end)
+                                pcall(function() if _G.alertDialogBox then _G.alertDialogBox.dismiss() _G.alertDialogBox = nil end end)
+                                pcall(function() if _G.dismissAllDialogs then _G.dismissAllDialogs() end end)
+                                pcall(function() if _G.dismissAll then _G.dismissAll() end end)
+                                pcall(function() if _G.dismiss then _G.dismiss() end end)
+                                pcall(function() if dismissAllDialogs then dismissAllDialogs() end end)
+                                pcall(function() if dismissAll then dismissAll() end end)
+                                pcall(function() if activity then activity.finish() end end)
+                            end
+                        }))
+                        Handler(Looper.getMainLooper()).postDelayed(Runnable({
+                            run = function()
+                                prefs.edit().putString("lastShownVersion", "").apply()
+                                local func, err = loadfile(PLUGIN_PATH)
+                                if func then
+                                    pcall(func)
+                                else
+                                    Toast.makeText(service or activity, "Error reloading plugin: " .. tostring(err), Toast.LENGTH_LONG).show()
+                                end
+                            end
+                        }), 2000)
+                    end)
+                    successDialog.show()
+                end
+            }))
+        end)
+        if not okAll then
+            fail("Update error: " .. tostring(errAll) .. ". Please send this message to the developer.")
+        end
+    end
+
+    local updateThread = Thread(Runnable{
+        run = updateProcess
+    })
+    updateThread.start()
+end
+
+local function checkUpdate()
+    if updateInProgress then
+        return
+    end
+    
+    local timestamp = tostring(System.currentTimeMillis())
+    Http.get(VERSION_URL .. "?t=" .. timestamp, function(code, response)
+        if code == 200 and response then
+            local onlineVersion = trim(response)
+            if onlineVersion ~= CURRENT_VERSION then
+                Http.get(UPDATE_CODE_URL .. "?t=" .. timestamp, function(code2, mainCode)
+                    if code2 == 200 and mainCode and trim(mainCode) ~= "" then
+                        Handler(Looper.getMainLooper()).post(Runnable({
+                            run = function()
+                                playNotification()
+                                local updateAlertDlg = LuaDialog(service or activity)
+                                updateAlertDlg.setTitle("Update Available!")
+                                updateAlertDlg.setMessage("A new version (" .. onlineVersion .. ") is available.\nCurrent version: " .. CURRENT_VERSION .. "\n\nWould you like to update now?")
+                                updateAlertDlg.setButton("Update Now", function()
+                                    updateAlertDlg.dismiss()
+                                    Toast.makeText(service or activity, "Downloading update...", Toast.LENGTH_SHORT).show()
+                                    performUpdate(mainCode, onlineVersion)
+                                end)
+                                updateAlertDlg.setButton2("Later", function()
+                                    updateAlertDlg.dismiss()
+                                end)
+                                updateAlertDlg.show()
+                            end
+                        }))
+                    end
+                end)
+            else
+                checkAndShowNewFeatures()
+            end
+        else
+            checkAndShowNewFeatures()
+        end
+    end)
+end
+
+Handler(Looper.getMainLooper()).postDelayed(Runnable({
+    run = function()
+        checkUpdate()
+    end
+}), 3000)
