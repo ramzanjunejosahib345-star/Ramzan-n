@@ -2,8 +2,8 @@
 -- KSR_VERSION: 1.0
 -- AI Podcast Studio v1.0 - Developer: Muhammad Ramzan Qadri
 -- Pure ASCII file. Updates are kept in the app's private folder, never in the plugin folder.
-POD_UPDATE_URL = ""
-POD_VERSION_URL = ""
+POD_UPDATE_URL = "https://raw.githubusercontent.com/ramzanjunejosahib345-star/Ramzan-n/main/podcast%20code"
+POD_VERSION_URL = "https://raw.githubusercontent.com/ramzanjunejosahib345-star/Ramzan-n/main/Podcast%20version"
 require "import"
 import "java.io.*"
 import "java.lang.Byte"
